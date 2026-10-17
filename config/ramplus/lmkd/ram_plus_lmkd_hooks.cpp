@@ -15,19 +15,18 @@
  */
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <unistd.h>
 #include <cstring>
 
 struct proc;
 
 namespace {
 
-std::atomic<int64_t> gRamPlusSwapKb{0};
 constexpr char kSwapPath[] = "/data/system/axion_ram_plus/swapfile";
 
-int64_t ReadRamPlusSwapKb() {
+int64_t ReadRamPlusFreeSwapPages() {
     FILE* swaps = fopen("/proc/swaps", "re");
     if (swaps == nullptr) {
         return 0;
@@ -47,8 +46,12 @@ int64_t ReadRamPlusSwapKb() {
     while (fscanf(swaps, "%255s %31s %lld %lld %d", path, type, &size_kb, &used_kb, &priority) ==
            5) {
         if (strcmp(path, kSwapPath) == 0) {
+            const long page_bytes = sysconf(_SC_PAGESIZE);
+            const int64_t page_k = page_bytes >= 1024 ? page_bytes / 1024 : 0;
+            const int64_t free_pages =
+                    page_k > 0 ? std::max<int64_t>(0, size_kb - used_kb) / page_k : 0;
             fclose(swaps);
-            return std::max<long long>(0, size_kb);
+            return free_pages;
         }
     }
 
@@ -59,7 +62,6 @@ int64_t ReadRamPlusSwapKb() {
 }
 
 extern "C" bool lmkd_update_props_hook() {
-    gRamPlusSwapKb.store(ReadRamPlusSwapKb(), std::memory_order_relaxed);
     return true;
 }
 
@@ -77,13 +79,12 @@ extern "C" int64_t lmkd_adjust_free_swap_hook(int64_t free_swap, int64_t easy_av
                                               int64_t compression_ratio,
                                               int64_t compression_ratio_div,
                                               int64_t adjusted_free_swap) {
-    const int64_t disk_total = std::max<int64_t>(0, gRamPlusSwapKb.load(std::memory_order_relaxed));
-    if (disk_total == 0 || compression_ratio <= 0 || compression_ratio_div <= 0) {
+    const int64_t disk_free = std::min(
+            std::max<int64_t>(0, free_swap), ReadRamPlusFreeSwapPages());
+    if (disk_free == 0 || compression_ratio <= 0 || compression_ratio_div <= 0) {
         return adjusted_free_swap;
     }
-
-    const int64_t disk_free = std::min(free_swap, disk_total);
-    const int64_t zram_free = std::max<int64_t>(0, free_swap - disk_total);
+    const int64_t zram_free = std::max<int64_t>(0, free_swap - disk_free);
     return disk_free +
            std::min(zram_free, easy_available * compression_ratio / compression_ratio_div);
 }
